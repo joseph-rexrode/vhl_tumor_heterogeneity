@@ -1,0 +1,285 @@
+---
+title: "Tumor Heterogeneity in VHL-Specific ccRCCs"
+output: pdf_document
+---
+
+# Library Imports
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+
+library(GEOquery)
+library(dplyr)
+library(Seurat)
+library(glmmTMB)
+library(ggplot2)
+library(rstatix)
+library(patchwork)
+library(UpSetR)
+library(tidyr)
+library(coin)
+library(grid)
+
+source("DownstreamAnalysis.R", local = knitr::knit_global())
+```
+
+# Data Loading / Cleaning
+
+```{r}
+
+gse <- getGEOSuppFiles("GSE254444")
+
+exp_data <- read.delim(
+  "GSE254444/GSE254444_ccRCC.raw_counts.annotations.txt.gz",
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+# first row, excluding column 1, has sample info
+sample_info <- as.character(exp_data[1, -1])
+
+# second row, excluding column 1, has cell type info
+cell_type_info <- as.character(exp_data[2,-1])
+
+# create data frame of just metadata info
+metadata <- data.frame(
+  sample = sample_info,
+  inferred_cell_type = cell_type_info
+)
+
+# metadata rows will be the cells (all columns besides 1st)
+rownames(metadata) <- colnames(exp_data)[-1]
+
+# remove metadata from original data
+exp_data <- exp_data[-c(1,2),]
+
+rownames(exp_data) <- exp_data$GeneID
+exp_data$GeneID <- NULL
+
+exp_data[] <- lapply(exp_data, as.numeric)
+exp_data <- as.matrix(exp_data)
+
+# create individual dataframes for each sample
+
+sample_list <- unique(metadata$sample)
+
+sample_data <- list()
+
+for (sample in sample_list) {
+  cellnames <- row.names(metadata[metadata$sample == sample, ])
+  sample_data[[sample]] <- as.matrix(exp_data[, cellnames])
+}
+
+
+```
+
+# Data Analysis
+
+## Initial Exploratory Visualization - All Samples
+
+```{r}
+
+allsamplesobj <- CreateSeuratObject(counts = exp_data, project = "AllSamples")
+
+cell_meta <- metadata[colnames(allsamplesobj), ]
+
+allsamplesobj <- AddMetaData(allsamplesobj, metadata = cell_meta)
+
+allsamplesobj <- NormalizeData(
+  allsamplesobj,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000
+)
+
+allsamplesobj <- FindVariableFeatures(
+  allsamplesobj,
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+allsamplesobj <- ScaleData(allsamplesobj, features = VariableFeatures(allsamplesobj))
+
+allsamplesobj <- RunPCA(allsamplesobj)
+allsamplesobj <- FindNeighbors(allsamplesobj)
+allsamplesobj <- FindClusters(allsamplesobj)
+
+allsamplesobj <- RunUMAP(allsamplesobj, dims = 1:20)
+
+DimPlot(
+  allsamplesobj,
+  reduction = "pca",
+  group.by = "sample"
+) +
+  labs(title = "PCA Dimensional Reduction Plot Separated by Sample",
+       x = "PC 1",
+       y = "PC 2") +
+  theme_minimal()
+
+p <- DimPlot(
+  allsamplesobj,
+  reduction = "umap",
+  split.by = "sample",
+  group.by = "inferred_cell_type",
+  dims = c(1, 2),
+) +
+  labs(title = "UMAP Visualization of PCA/Clustering - Separated",
+       x = "UMAP 1",
+       y = "UMAP 2") +
+  theme_minimal()
+
+p & theme(panel.border = element_rect(color = "black", fill = NA, size = 1))
+
+DimPlot(
+  allsamplesobj,
+  reduction = "umap",
+  group.by = "sample",
+  dims = c(1, 2),
+) +
+  labs(title = "Initial UMAP Visualization of PCA/Clustering",
+       x = "UMAP 1",
+       y = "UMAP 2") +
+  theme_minimal()
+
+ElbowPlot(allsamplesobj, ndims = 50) + 
+  labs(title = "Elbow Plot - Examining PC Variation",
+       x = "Principal Component (PC)") +
+  theme_minimal()
+
+names(head(sort(abs(Loadings(allsamplesobj)[,2]), decreasing = TRUE), 20))
+
+gene_means <- list()
+gene_vars <- list()
+
+counts <- GetAssayData(
+  allsamplesobj,
+  layer = "counts",
+  assay = "RNA"
+)
+
+gene_means <- rowMeans(counts)
+gene_vars <- apply(
+  counts, 1, var
+)
+
+gene_df <- data.frame(gene_means = gene_means, gene_vars = gene_vars)
+
+
+ggplot(data = gene_df[gene_df$gene_vars < 50000, ], 
+       mapping = aes(x = gene_means, y = gene_vars)) +
+  geom_point(color = "#364d6c") +
+  geom_smooth(color = "#78C091", se = F) +
+  labs(title = "Mean-Variance Relationship",
+       x = "Mean Expression",
+       y = "Variance")
+
+```
+
+## HVGs for Individual Samples
+
+```{r}
+
+seurat_list <- lapply(names(sample_data), function(sample) {
+  
+  obj <- CreateSeuratObject(
+    counts = sample_data[[sample]],
+    project = sample
+  )
+  
+  cell_meta <- metadata[colnames(obj), ]
+  
+  obj <- AddMetaData(obj, metadata = cell_meta)
+  
+  return(obj)
+})
+
+names(seurat_list) <- names(sample_data)
+
+top_genes <- list()
+top_genes_fromAll <- list()
+
+# Normalize and find 2000 HVGs for each sample
+
+hvg_2000 <- list()
+
+for (sample in names(seurat_list)) {
+  
+  o <- seurat_list[[sample]]
+  
+  o <- NormalizeData(
+    o,
+    normalization.method = "LogNormalize",
+    scale.factor = 10000
+  )
+  
+  o <- FindVariableFeatures(
+    o, 
+    selection.method = "vst",
+    nfeatures = 2000
+  )
+  
+  hvg_2000[[sample]] <- VariableFeatures(o)
+}
+
+shared_genes <- Reduce(
+  intersect,
+  hvg_2000
+)
+
+upset(fromList(hvg_2000), 
+      order.by = c("freq"), 
+      nsets = 6, 
+      main.bar.color = "#364d6c",
+      matrix.color = "#364d6c",
+      shade.color = "#bedeff",
+      sets.bar.color = "#364d6c",
+      queries = list(
+        list(query = intersects,
+             params = list("L1", "L2", "L4", "L5_1", "L7", "LN"),
+             color = "#78C091",
+             active = TRUE)
+      ))
+grid.text("HVG Overlap in Tumor Samples", x = 0.65, y = 0.95,
+          gp = gpar(fontsize = 20))
+
+all_var <- VariableFeatures(allsamplesobj)
+
+shared_ranked <- all_var[all_var %in% shared_genes]
+
+top200_shared <- head(shared_ranked, 200)
+
+for (sample in names(seurat_list)) {
+  top_genes_fromAll[[sample]] <- shared_genes
+}
+
+names(seurat_list) <- sample_list
+
+
+```
+
+## Downstream Analysis
+
+```{r}
+
+# primary analysis
+sameHVGTrial <- downstreamAnalysis(top_genes_fromAll, "SameHVGs")
+
+# Convert Dunn Test results into heatmap
+
+ggplot(sameHVGTrial$dunn_results,
+       aes(group1, group2,
+           fill = log10(p.adj))) +
+  geom_tile() +
+  labs(
+    title = "Pairwise Dunn Test Results",
+    fill = "-log10(p)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal()
+
+# Gene expression variability is driven more by inter-tumor heterogeneity 
+# than by a simple tumor-versus-normal distinction.
+
+```
